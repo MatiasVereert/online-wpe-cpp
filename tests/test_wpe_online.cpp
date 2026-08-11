@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
 
     // --- Instantiate and run frame-by-frame --------------------------------
     OnlineWPE<NUM_CHANNELS> wpe(
-        static_cast<float>(alpha), taps, delay, M, F, power_estimate);
+        alpha, taps, delay, M, F, power_estimate);
 
     std::vector<Complex> X_hat(n_total, Complex(0.0, 0.0));
 

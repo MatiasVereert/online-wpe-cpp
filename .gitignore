@@ -1,0 +1,13 @@
+# Build artifacts
+*.o
+src/cpp/example
+tests/test_wpe_online
+# Large regenerable data (regenerate with tests/gen_signals.py)
+tests/*.bin
+tests/*.npz
+tests/*.wav
+# Vitis HLS project outputs (regenerables, enormes)
+hls/proj/
+*.log
+*.jou
+.autopilot/
