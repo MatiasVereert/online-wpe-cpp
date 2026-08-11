@@ -8,30 +8,69 @@ using Complex = std::complex<double>;
 template <size_t num_channels>
 
 class OnlineWPE {
-public:
-  float alpha; 
-  int K;  // taps 
-  int delay;
-  int M ; // Mics dimension 
-  int F ; // Frecuency bins
+  private:
+    // Helper Methods for Indexation
+    inline size_t get_cov_idx(int f, int m_row, int k_row, int m_col, int k_col ) const {
+      return f * (M * K * M * K) 
+            + m_row * (K * M * K) 
+            + k_row * (M * K)
+            + m_col * K
+            + k_col; 
+    }
+    inline size_t get_cov_right_term_idx(int m_row, int k_row, int m_col, int k_col ) const {
+      return  m_row * (K * M * K) 
+            + k_row * (M * K)
+            + m_col * K
+            + k_col; 
+    }
+    inline size_t get_filter_taps_idx(int f, int m_row, int k_row, int m_col) const {
+      // Added frequency stride calculation
+      return f * (M * K * M) 
+           + m_row * (K * M) 
+           + k_row * M
+           + m_col;
+    }
 
-  std::vector<Complex> inv_cov;
-  std::vector<Complex> filter_taps;
-  std::vector<double> power;
-  std::vector<Complex> kalman_gain;
-  // Aux
-  std::vector<Complex> inv_cov_right_term;
+    inline size_t get_kalman_gain_idx( int f, int m_row, int k_row) const {
+      return f * (M*K) + m_row * K+ k_row;
+    }
 
-  std::array<std::vector<Complex>, num_channels> buffer;
+    inline size_t get_buffer_idx( int f, int k_tap) const {
+      // taps axis is mirrored to align with math
+      // buffer has (past samples)<(present)
+      // this idx returns (past samples)>(present)
+      return f * (K + delay +1) + K - 1 -k_tap; 
+    }
 
-  // Define the constructor
 
-  OnlineWPE( float a, int b, int c, int d, int e, double power_estimate); 
 
-  void update_buffer(const std::array<std::vector<Complex>, num_channels> & new_frame);
-  void update_power_block();
-  void update_kalman_gain();
-  void update_inv_cov();
+  public:
+    float alpha; 
+    int K;  // taps 
+    int delay;
+    int M ; // Mics dimension 
+    int F ; // Frecuency bins
+
+    std::vector<Complex> inv_cov;
+    std::vector<Complex> filter_taps;
+    std::vector<double> power;
+    std::vector<Complex> kalman_gain;
+    std::vector<Complex> prediction; 
+    // Aux
+
+    std::array<std::vector<Complex>, num_channels> buffer;
+
+    // Define the constructor
+
+    OnlineWPE( float a, int b, int c, int d, int e, double power_estimate); 
+
+    void update_buffer(const std::array<std::vector<Complex>, num_channels> & new_frame);
+    void update_power_block();
+    void update_kalman_gain();
+    void update_inv_cov();
+    void update_taps();
+    const std::vector<Complex>& step_frame(const std::array<std::vector<Complex>, num_channels> & new_frame);
+    void get_prediction(const std::array<std::vector<Complex>, num_channels> & new_frame);
 
 };
 
@@ -56,10 +95,9 @@ OnlineWPE<num_channels>::OnlineWPE( float a, int b, int c, int d, int e, double 
   inv_cov.resize(inv_cov_len, Complex(0.0,0.0)); //shape (F, MK, MK)
   power.resize(F , power_estimate); 
   kalman_gain.resize( F* K* M, Complex(0.0,0.0));
+  prediction.resize(F* M, Complex(0.0,0.0) );
 
   // Auxiliar
-  inv_cov_right_term.resize( M*K*M*K, Complex(0.0,0.0) )
-
   for( int f = 0; f <F; f++ ) {
   diag_idx_f = f * cov_matrix_size * cov_matrix_size;
 
@@ -74,18 +112,111 @@ OnlineWPE<num_channels>::OnlineWPE( float a, int b, int c, int d, int e, double 
     buffer[ch].resize( F * ( K + delay + 1));
   }
 }
+template <size_t num_channels>
+const std::vector<Complex>& OnlineWPE<num_channels>::step_frame(const std::array<std::vector<Complex>, num_channels> & new_frame) {
+
+    get_prediction(new_frame);
+    update_buffer(new_frame);
+    update_power_block();
+    update_kalman_gain();
+    update_inv_cov();
+    update_taps();
+
+    // Return by constant reference to avoid expensive memory copies during runtime
+    return prediction;
+}
+
+template <size_t num_channels>
+  void OnlineWPE<num_channels>::get_prediction(const std::array<std::vector<Complex>, num_channels> & new_frame){
+
+  int  taps_idx; 
+  int  buffer_idx;
+  std::fill( prediction.begin(), prediction.end(), Complex(0.0, 0.0));
+
+  for (int f=0;f<F; ++f){
+    //brodcast f1
+    
+
+    for (int m0=0; m0<M; ++m0){
+      Complex inner_summ(0.0,0.0);
+      for (int k=0; k<K; ++k){
+        for (int m1=0; m1<M; ++m1){
+          taps_idx = get_filter_taps_idx(f, m1, k, m0);
+          buffer_idx = get_buffer_idx(f , k);
+
+          inner_summ += std::conj(filter_taps[taps_idx]) * buffer[m1][buffer_idx];
+        }
+      } 
+      pred_idx = f * M + m0;
+      prediction[pred_idx] = new_frame[m0][f] - inner_summ;
+    }
+  }
+}
 
 
-template <size_t numb_channels>
-void OnlineWPE<numb_channels>::update_inv_cov(){
-  // Clean aux vector
-  std::fill(inv_cov_right_term.begin();inv_cov_right_term.end(), Complex(0.0,0.0));
+
+template <size_t num_channels>
+void OnlineWPE<num_channels>::update_taps(){
+  int kalman_idx; 
+  int taps_idx;
+  // x_hat has dimensin M
+
+
+  //(DK,1)(D)-> (DK,D)
+  for (int f=0;f<F; ++f){
+    //brodcast f
+    for (int m0=0; m0<M; ++m0){
+      for (int k=0; k<K; ++k){
+        for (int m1=0; m1<M; ++m1){
+          // indices
+          kalman_idx = get_kalman_gain_idx(f, m0, k );
+          taps_idx = get_filter_taps_idx( f, m0, k, m1);
+
+          filter_taps[taps_idx] += kalman_gain[kalman_idx] * std::conj(prediction[ f* M+ m1]); 
+        }
+      } 
+    }
+  }
+}
+
+template <size_t num_channels>
+void OnlineWPE<num_channels>::update_inv_cov(){
 
   // Define stridles
+  int kalman_idx;
+  int buffer_idx; 
+  int cov_inv_idx; 
 
+  for (int f= 0; f<F; ++f){
 
+    for (int m0=0; m0<M; ++m0){
+      for (int k0=0; k0<K; ++k0){
+        Complex inner_summ(0.0,0.0);
 
+        for (int m1=0; m1<M; ++m1){
+          for (int k1=0; k1<K; ++k1){
+            // first operation is y_buffer dot R_inv (1, MK)(MK,MK) (1, MK)
+            buffer_idx = get_buffer_idx(f,k1);
+            inv_cov_idx = get_inv_cov_idx(f,m1,k1,m0,k0 );
+
+            inner_summ += std::conj(buffer[m1][buffer_idx]) * inv_cov[inv_cov_idx];
+          }
+        }
+      for (int m1=0; m1<M; ++m1){
+          for (int k1=0; k1<K; ++k1){ 
+            cov_inv_idx = get_inv_cov_idx(f, m1, k1, m0, k0 );
+            kalman_idx = get_kalman_gain_idx(f, m1,k1);
+
+            inv_cov[inv_cov_idx] = (inv_cov[inv_cov_idx] - 
+                                inner_summ * kalman_gain[kalman_idx])/ alpha;
+          }
+        }
+      }
+    }
+  }
 }
+
+
 
 template <size_t num_channels>
 void OnlineWPE<num_channels>::update_kalman_gain(){
@@ -140,6 +271,7 @@ void OnlineWPE<num_channels>::update_kalman_gain(){
         }
       }
     }
+
   Complex denominator(alpha * power[f], 0.0);
   // Vector product of denom
   for (int m = 0; m<M; ++m){
