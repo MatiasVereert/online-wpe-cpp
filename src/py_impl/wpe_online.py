@@ -96,6 +96,8 @@ def frame_online_WPE(Y_in, taps, delay, delta, alpha = 0.99999):
     # Update G
     G_frame = G_frame + np.einsum( 'fk,fd->fkd', K, X_hat_frame.conj())
 
+    
+
   return X_hat
 
 

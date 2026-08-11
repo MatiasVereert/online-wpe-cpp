@@ -35,6 +35,11 @@ class OnlineWPE {
       return f * (M*K) + m_row * K+ k_row;
     }
 
+    inline size_t get_window_idx( int f, int m, int k) const {
+      // Snapshot of the regression window, layout (F, M, K)
+      return f * (M*K) + m * K + k;
+    }
+
     inline size_t get_buffer_idx( int f, int k_tap) const {
       // taps axis is mirrored to align with math
       // buffer has (past samples)<(present)
@@ -45,7 +50,7 @@ class OnlineWPE {
 
 
   public:
-    float alpha; 
+    double alpha; 
     int K;  // taps 
     int delay;
     int M ; // Mics dimension 
@@ -55,7 +60,8 @@ class OnlineWPE {
     std::vector<Complex> filter_taps;
     std::vector<double> power;
     std::vector<Complex> kalman_gain;
-    std::vector<Complex> prediction; 
+    std::vector<Complex> prediction;
+    std::vector<Complex> window;  // regression window snapshot (F, M, K)
     // Aux
 
     std::array<std::vector<Complex>, num_channels> buffer;
@@ -96,6 +102,7 @@ OnlineWPE<num_channels>::OnlineWPE( float a, int b, int c, int d, int e, double 
   power.resize(F , power_estimate); 
   kalman_gain.resize( F* K* M, Complex(0.0,0.0));
   prediction.resize(F* M, Complex(0.0,0.0) );
+  window.resize( F* M* K, Complex(0.0,0.0));
 
   // Auxiliar
   for( int f = 0; f <F; f++ ) {
@@ -129,24 +136,37 @@ const std::vector<Complex>& OnlineWPE<num_channels>::step_frame(const std::array
 template <size_t num_channels>
   void OnlineWPE<num_channels>::get_prediction(const std::array<std::vector<Complex>, num_channels> & new_frame){
 
-  int  taps_idx; 
-  int  buffer_idx;
+  int  taps_idx;
+  int  window_idx;
+  int pred_idx;
   std::fill( prediction.begin(), prediction.end(), Complex(0.0, 0.0));
+
+  // Snapshot the regression window from the CURRENT buffer, before the new
+  // frame is pushed by update_buffer. The RLS updates (kalman gain, inv_cov)
+  // must reuse exactly this window, mirroring nara's OnlineWPE where `window`
+  // is computed once and passed to every update.
+  for (int f=0; f<F; ++f){
+    for (int m1=0; m1<M; ++m1){
+      for (int k=0; k<K; ++k){
+        window[get_window_idx(f, m1, k)] = buffer[m1][get_buffer_idx(f, k)];
+      }
+    }
+  }
 
   for (int f=0;f<F; ++f){
     //brodcast f1
-    
+
 
     for (int m0=0; m0<M; ++m0){
       Complex inner_summ(0.0,0.0);
       for (int k=0; k<K; ++k){
         for (int m1=0; m1<M; ++m1){
           taps_idx = get_filter_taps_idx(f, m1, k, m0);
-          buffer_idx = get_buffer_idx(f , k);
+          window_idx = get_window_idx(f, m1, k);
 
-          inner_summ += std::conj(filter_taps[taps_idx]) * buffer[m1][buffer_idx];
+          inner_summ += std::conj(filter_taps[taps_idx]) * window[window_idx];
         }
-      } 
+      }
       pred_idx = f * M + m0;
       prediction[pred_idx] = new_frame[m0][f] - inner_summ;
     }
@@ -184,8 +204,7 @@ void OnlineWPE<num_channels>::update_inv_cov(){
 
   // Define stridles
   int kalman_idx;
-  int buffer_idx; 
-  int cov_inv_idx; 
+  int inv_cov_idx;
 
   for (int f= 0; f<F; ++f){
 
@@ -196,19 +215,19 @@ void OnlineWPE<num_channels>::update_inv_cov(){
         for (int m1=0; m1<M; ++m1){
           for (int k1=0; k1<K; ++k1){
             // first operation is y_buffer dot R_inv (1, MK)(MK,MK) (1, MK)
-            buffer_idx = get_buffer_idx(f,k1);
-            inv_cov_idx = get_inv_cov_idx(f,m1,k1,m0,k0 );
+            inv_cov_idx = get_cov_idx(f,m1,k1,m0,k0 );
 
-            inner_summ += std::conj(buffer[m1][buffer_idx]) * inv_cov[inv_cov_idx];
+            inner_summ += std::conj(window[get_window_idx(f, m1, k1)]) * inv_cov[inv_cov_idx];
           }
         }
       for (int m1=0; m1<M; ++m1){
           for (int k1=0; k1<K; ++k1){ 
-            cov_inv_idx = get_inv_cov_idx(f, m1, k1, m0, k0 );
+            inv_cov_idx = get_cov_idx(f, m1, k1, m0, k0 );
             kalman_idx = get_kalman_gain_idx(f, m1,k1);
 
             inv_cov[inv_cov_idx] = (inv_cov[inv_cov_idx] - 
                                 inner_summ * kalman_gain[kalman_idx])/ alpha;
+
           }
         }
       }
@@ -220,13 +239,11 @@ void OnlineWPE<num_channels>::update_inv_cov(){
 
 template <size_t num_channels>
 void OnlineWPE<num_channels>::update_kalman_gain(){
-  int num_frames = K + delay +1;
   int len_MK = M * K;
   int len_KMK = K * M * K;
   int m_left_idx = 0;
   int k_left_idx = 0;
   int m_right_idx = 0;
-  int f_idx_buff = 0;
   int f_idx_vec  =0;
   int m_left_vec = 0;
   int idx_m =0;
@@ -244,8 +261,7 @@ void OnlineWPE<num_channels>::update_kalman_gain(){
   for (int f= 0; f<F; ++f ){
     f_idx = f * len_MK * len_MK;
     f_idx_vec = f * len_MK;
-    f_idx_buff  = f * num_frames;
-    
+
     // Aux vector
    
   
@@ -266,7 +282,7 @@ void OnlineWPE<num_channels>::update_kalman_gain(){
           for ( int k_right = 0; k_right < K; ++k_right){
 
             kalman_gain[f_idx_vec   + m_left_vec + k_left ] +=  inv_cov[f_idx + m_right_idx + k_right]
-                                                              * buffer[m_right][ f_idx_buff + K - 1 -k_right];
+                                                              * window[get_window_idx(f, m_right, k_right)];
           }       
         }
       }
@@ -277,7 +293,7 @@ void OnlineWPE<num_channels>::update_kalman_gain(){
   for (int m = 0; m<M; ++m){
     idx_m = m * K;
     for (int k= 0; k<K; ++k){
-      denominator += std::conj(buffer[m][f_idx_buff + K - 1 - k]) * kalman_gain[f_idx_vec + idx_m + k  ];
+      denominator += std::conj(window[get_window_idx(f, m, k)]) * kalman_gain[f_idx_vec + idx_m + k  ];
     }
   }
   // Scalar divition
